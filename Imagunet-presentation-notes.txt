@@ -1,0 +1,239 @@
+-- IMAGUNET EVENT, MEDELLIN 16 de AGOSTO 2023
+######################
+# 1 Objetos Avanzados
+######################
+
+Built-in Functions:
+A built-in function is one that is provided with the database. There are many (100?). Examples:
+select now();
+select upper('medellín');
+select round(12345.9999,2);
+select format(12345.9999,2);
+select truncate(12345.9999,2);
+select format(truncate(12345.9999,2),2);
+select substr('bienvenido a Medellín, Colombia',1,21);
+
+Session Variables:
+select units_sold*unit_price from invoice_items where invoice_id=5004;
+select sum(units_sold*unit_price) from invoice_items where invoice_id=5004;
+select sum(units_sold*unit_price) into @5004_total_sale from invoice_items where invoice_id=5004;
+select @5004_total_sale;
+
+User-defined Procedures
+drop procedure if exists P_REQUEST_VERIFY;
+delimiter //
+CREATE PROCEDURE `P_REQUEST_VERIFY`()
+LANGUAGE SQL
+NOT DETERMINISTIC
+CONTAINS SQL
+SQL SECURITY DEFINER
+COMMENT ''
+BEGIN
+  UPDATE invoices SET request_verify=NOW() WHERE accounting_code='X' 
+  AND sale_datetime < NOW() - INTERVAL 1 DAY;
+END;
+//
+delimiter ;
+
+drop procedure if exists P_INVOICE_VERIFY;
+delimiter //
+CREATE   PROCEDURE `P_INVOICE_VERIFY`(
+	IN `in_invoice_id` BIGINT,
+	IN `in_verifier` VARCHAR(150)
+)
+LANGUAGE SQL
+NOT DETERMINISTIC
+CONTAINS SQL
+SQL SECURITY DEFINER
+COMMENT ''
+BEGIN
+  UPDATE invoices SET accounting_code='K', verified=NOW(), verified_by=in_verifier WHERE invoice_id=in_invoice_id;
+END;
+//
+delimiter ;
+call P_INVOICE_VERIFY(4097,'Edward');
+
+User-defined Functions
+
+drop function if exists F_LAST_VERIFIED_INVOICE;
+delimiter //
+CREATE FUNCTION `F_LAST_VERIFIED_INVOICE`()
+RETURNS BIGINT
+LANGUAGE SQL
+DETERMINISTIC
+CONTAINS SQL
+SQL SECURITY DEFINER
+COMMENT ''
+BEGIN
+DECLARE var_invoice_id BIGINT;
+  SELECT invoice_id INTO var_invoice_id FROM invoices WHERE accounting_code !='X' ORDER BY verified DESC LIMIT 1;
+  if var_invoice_id is null then set var_invoice_id=0; end if;
+  RETURN var_invoice_id;
+END;
+//
+delimiter ;
+
+
+# EVENTS
+drop event if exists EV_REQUEST_VERIFY;
+delimiter //
+CREATE EVENT `EV_REQUEST_VERIFY`
+    ON SCHEDULE
+        EVERY 1 HOUR STARTS now() + interval 30 second
+    ON COMPLETION PRESERVE
+    ENABLE
+    COMMENT ''
+    DO 
+BEGIN
+ CALL P_REQUEST_VERIFY();
+END;
+//
+delimiter ;
+
+
+COMPOUND STATEMENTS OUTSIDE STORED PROGRAMS (for scripting!)
+
+DELIMITER //
+BEGIN NOT ATOMIC
+
+  select F_LAST_VERIFIED_INVOICE() into @LAST_INVOICE;
+
+END;
+//
+DELIMITER ;
+select @LAST_INVOICE;
+
+# SEQUENCES
+drop sequence if exists my_seq;
+CREATE SEQUENCE my_seq START WITH 100 INCREMENT BY 10;
+select * from information_schema.tables where table_name='my_seq';
+select NEXT VALUE FOR my_seq;
+
+https://mariadb.com/kb/en/sequence-storage-engine/
+Dynamic-single use sequences:
+select * from seq_1_to_100;
+
+
+######################
+# 2 Storage Engines
+######################
+
+Spider Example:
+https://mariadb.com/kb/en/spider-installation/
+
+SELECT ENGINE, SUPPORT FROM information_schema.ENGINES WHERE ENGINE = 'SPIDER';
+
+CREATE SERVER imagunet1 FOREIGN DATA WRAPPER mysql
+OPTIONS ( HOST '192.168.8.221', DATABASE 'imagunet', USER 'edward', PASSWORD 'password', PORT 3306);
+
+create schema if not exists imagunet_spider;
+use imagunet_spider;
+
+drop table if exists imagunet_spider.invoices;
+CREATE TABLE imagunet_spider.invoices (
+  `invoice_id` bigint(20),
+  `customer_id` bigint(20) DEFAULT NULL,
+  `sale_datetime` datetime DEFAULT NULL,
+  `sale_location` varchar(100) DEFAULT NULL,
+  `accounting_code` char(1) DEFAULT 'X',
+  `verified` datetime DEFAULT NULL,
+  `verified_by` varchar(150) DEFAULT NULL,
+  `request_verify` datetime DEFAULT NULL
+) ENGINE=Spider COMMENT='wrapper "mysql", srv "imagunet1", table "invoices"';
+
+
+Columnstore example:
+On source database, create CSV of data:
+
+select * from invoice_items_archive
+INTO OUTFILE '/tmp/invoice_items_archive.csv'
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n';
+
+create schema if not exists cs;
+use cs;
+CREATE TABLE `invoice_items_archive` (
+  `invoice_id` bigint(20) DEFAULT NULL,
+  `product_code` varchar(30) DEFAULT NULL,
+  `units_sold` int(10) DEFAULT NULL,
+  `unit_price` decimal(8,2) DEFAULT NULL
+) ENGINE=Columnstore DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+# scp CSV from source to columnstore server:
+scp /tmp/invoice_items_archive.csv root@imagunet3:/tmp/
+# on columnstore server:
+cpimport -E '"' -s ',' cs invoice_items_archive /tmp/invoice_items_archive.csv
+
+select count(*) as count, sum(units_sold) as all_units, avg(unit_price) as avg_unit_price from invoice_items_archive;
+
+Use spider to load data into Columnstore table:
+drop table if exists `imagunet_spider`.`invoice_items_archive`;
+CREATE TABLE `imagunet_spider`.`invoice_items_archive` (
+  `invoice_id` bigint(20) DEFAULT NULL,
+  `product_code` varchar(30) DEFAULT NULL,
+  `units_sold` int(10) DEFAULT NULL,
+  `unit_price` decimal(8,2) DEFAULT NULL
+) ENGINE=Spider COMMENT='wrapper "mysql", srv "imagunet1", table "invoice_items_archive"';
+
+set session columnstore_use_import_for_batchinsert=ALWAYS;
+truncate table cs.invoice_items_archive;
+insert into cs.invoice_items_archive select * from imagunet_spider.invoice_items_archive;
+
+######################
+# 3 Stream mariabackup
+######################
+
+#### RESTORE PRIMARY TO REPLICA - STREAM TO DATADIR ON REPLICA
+
+# TESTED USING PASSWORDLESS SSH
+
+###########################################
+# on REPLICA/SLAVE SERVER:
+systemctl stop mariadb
+
+# define:
+datadir=/var/lib/mysql
+logdir=/var/log/mysql
+
+# clean out old $datadir and $logdir. CAREFUL! If $datadir and $logdir are not defined, you could destroy everything.
+# Double check, you are on the REPLICA
+# at your risk: rm -fr $datadir/*  
+# at your risk: rm -fr $logdir/*  
+
+##### ON MASTER #################
+
+datadir=/var/lib/mysql  #DATADIR OF REPLICA!
+replica=192.168.8.222
+mariabackup --user=root --backup --stream=xbstream | ssh root@"$replica" -t "cd $datadir; mbstream  -x"
+
+grant replication slave on *.* to `repl`@`%` identified by 'password';
+flush privileges;
+
+##### ON REPLICA #################
+
+mhost=imagunet1.edw.ee     # primary node
+datadir=/var/lib/mysql
+logdir=/var/log/mysql
+mport=3306
+mpw=password
+muser=repl
+
+# you can test the connectivity from this replica node to the primary:
+mariadb -h$mhost -u$muser -p$mpw -ABNe "select now()"
+2023-04-20 11:58:57
+
+cd $datadir
+
+gtid=$(cat $datadir/xtrabackup_binlog_info | tail -1 | awk '{print $3}')
+echo $gtid $mhost $mport $muser $mpw
+
+mariabackup --prepare --target-dir=$datadir
+chown -R mysql:mysql $datadir
+chown -R mysql:mysql $logdir
+
+systemctl start mariadb;
+
+mariadb -ABNe "stop slave; reset slave; set global gtid_slave_pos='$gtid'; change master to master_host='$mhost', master_port=$mport, master_user='$muser', master_password='$mpw', master_use_gtid=slave_pos; start slave;"
+
+mysql -Ae "show replica status\G"
+
